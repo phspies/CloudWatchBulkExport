@@ -1,0 +1,592 @@
+
+# The sample code; software libraries; command line tools; proofs of concept; templates; or other related technology (including any of the foregoing that are 
+# provided by our personnel) is provided to you as AWS Content under the AWS Customer Agreement, or the relevant written agreement between you and AWS (whichever applies). 
+# You should not use this AWS Content in your production accounts, or on production or other critical data. You are responsible for testing, securing, and optimizing the AWS Content, 
+# such as sample code, as appropriate for production grade use based on your specific quality control practices and standards. Deploying AWS Content may incur AWS charges for creating 
+# or using AWS chargeable resources, such as running Amazon EC2 instances or using Amazon S3 storage.”
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: ""
+Parameters:
+    S3Bucket:
+        Type: String
+        Description : "S3 Bucket that will be used as the target for the exports"
+Resources:
+    CloudWatchLogGroupExportLockDynamoTable:
+        Type: "AWS::DynamoDB::Table"
+        Properties:
+            AttributeDefinitions: 
+              - 
+                AttributeName: "locked"
+                AttributeType: "S"
+            KeySchema: 
+              - 
+                AttributeName: "locked"
+                KeyType: "HASH"
+            ProvisionedThroughput: 
+                ReadCapacityUnits: 1
+                WriteCapacityUnits: 1
+
+    CloudWatchLogGroupExportsDynamoTable:
+        Type: "AWS::DynamoDB::Table"
+        Properties:
+            AttributeDefinitions: 
+              - 
+                AttributeName: "loggroup"
+                AttributeType: "S"
+            KeySchema: 
+              - 
+                AttributeName: "loggroup"
+                KeyType: "HASH"
+            ProvisionedThroughput: 
+                ReadCapacityUnits: 5
+                WriteCapacityUnits: 5
+
+    FilterCloudWatchLogGroupsLambdaFunction:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: "Filter and find log groups with ExportToS3 tag with interval value as days"
+            Environment:
+              Variables: 
+                DynamoDBTable: !Ref CloudWatchLogGroupExportsDynamoTable
+                MaxRecordCount: 10
+            Handler: "index.lambda_handler"
+            Architectures: 
+              - "arm64"
+            Code: 
+                ZipFile: !Sub |
+                    import json
+                    import boto3
+                    import time
+                    import os
+                    from datetime import datetime
+                    from botocore.config import Config
+                    from re import sub
+
+                    def lambda_handler(event, context):
+                        nextPageToken=None
+                        if "Payload" in event:
+                            if "nextToken" in event["Payload"]:
+                                nextPageToken = event["Payload"]["nextToken"]
+                                print("Starting at", nextPageToken)
+                            else:
+                                print("No NextToken, starting at the beginning")
+                            
+                        #set rety variables for boto3 client
+                        config = Config(
+                          retries = {
+                              'max_attempts': 10,
+                              'mode': 'standard'
+                          }
+                        )
+                        dbclient = boto3.resource('dynamodb', config=config)
+                        logsclient = boto3.client('logs', config=config)
+                        currenttimestamp = int(float(datetime.utcnow().strftime('%s.%f')) * 1e3)
+                        table = dbclient.Table(os.environ['DynamoDBTable'])
+                        print("Current timestamp:", datetime.fromtimestamp(int(currenttimestamp)/1000.0))
+                        data = []
+                        paginator = logsclient.get_paginator('describe_log_groups')
+                        pagingconfig = {"PageSize": int(os.environ['MaxRecordCount'])}
+                        if nextPageToken != None:
+                            pagingconfig["StartingToken"] = nextPageToken
+                        iterator = paginator.paginate(PaginationConfig=pagingconfig)
+                        nexttoken = ""
+                        for page in iterator:
+                            if "nextToken" in page.keys():
+                                nexttoken = page["nextToken"]
+                                print ("Next page start token", page["nextToken"])
+                                
+                            for loggroup in page["logGroups"]:
+                                friendlyloggroup = camel_case(loggroup['logGroupName'])
+                                tagresponse = logsclient.list_tags_for_resource(resourceArn=loggroup["arn"][:-2])
+                                if "ExportToS3" in tagresponse['tags']:
+                                    dataresponse = table.get_item(Key={"loggroup": friendlyloggroup}, ConsistentRead=True)
+                                    if "Item" in dataresponse:
+                                        lastexport =  int(dataresponse['Item']['lastexport'])
+                                        runinterval = tagresponse['tags']["ExportToS3"]
+                                        nextexport = int(lastexport) + (int(runinterval) * 24 * 60 * 60 * 1000)
+                                        if nextexport < currenttimestamp:
+                                            data.append({"loggroup" : loggroup['logGroupName'], "interval":tagresponse['tags']["ExportToS3"] })
+                                        else:
+                                            print(loggroup['logGroupName'],"next run timestamp:", datetime.fromtimestamp(int(nextexport)/1000.0) )
+                                    else:
+                                        data.append({"loggroup" : loggroup['logGroupName'], "interval":tagresponse['tags']["ExportToS3"] })
+                              
+                        return { "nextToken": nexttoken, "data": data , "records": len(data) }
+                        
+                    def camel_case(s):
+                        s = s.replace("/","_")
+                        s = sub(r"(_|-)+", " ", s).title().replace(" ", "")
+                        return ''.join([s[0].lower(), s[1:]])
+
+            MemorySize: 128
+            Role: !GetAtt LambdaCloudWatchLogGroupExportsRole.Arn
+            Runtime: "python3.10"
+            Timeout: 900
+            TracingConfig: 
+                Mode: "PassThrough"
+            EphemeralStorage: 
+                Size: 512
+
+    ExportCloudWatchLogGroupsLambdaFunction:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: "Export tagged log groups to specified S3 Bucket"
+            Environment: 
+                Variables: 
+                  S3Bucket: !Ref S3Bucket
+                  DynamoDBTable: !Ref CloudWatchLogGroupExportsDynamoTable
+                  DefaultHistoryDays: 7
+            Handler: "index.lambda_handler"
+            Architectures: 
+              - "arm64"
+            Code: 
+                ZipFile: !Sub |
+                      import json
+                      import boto3
+                      import time
+                      import os
+                      from datetime import datetime, timedelta
+                      import ast
+                      from boto3.dynamodb.conditions import Key, Attr
+                      from botocore.config import Config
+                      from re import sub
+
+
+                      def lambda_handler(event, context):
+                          #set rety variables for boto3 client
+                          config = Config(
+                            retries = {
+                                'max_attempts': 10,
+                                'mode': 'standard'
+                            }
+                          )
+
+                          #define dynamodb and logs clients
+                          global logclient
+                          global dbclient
+                          dbclient = boto3.resource('dynamodb', config=config)
+                          logclient = boto3.client('logs', config=config)
+                          
+                          aws_account_id = context.invoked_function_arn.split(":")[4]
+                          startexecution = int(float(datetime.utcnow().strftime('%s.%f')) * 1e3)
+                          startstamp=int(float((datetime.now() - timedelta(days=int(os.environ['DefaultHistoryDays']))).strftime('%s.%f')) * 1e3)
+                          friendlyloggroup = camel_case(event["loggroup"])
+                          runinterval = event["interval"]
+                          nextexport= int(startexecution) + int(runinterval) * 24 * 60 * 60 * 1000
+
+                          print("Processing: ", event["loggroup"], "with a", runinterval, "day interval")
+                          table = dbclient.Table(os.environ['DynamoDBTable'])
+                          response = table.get_item(Key={"loggroup": friendlyloggroup}, ConsistentRead=True)
+                          if "Item" in response:
+                              startstamp =  response['Item']['lastexport']
+                          else:
+                              data = table.put_item(Item={'loggroup': friendlyloggroup, "lastexport": 0, "lastmessage": ""} )
+
+                          print("Export task time frame: start:"+str(startstamp) + ", end: " + str(startexecution))
+                          try:
+                              #Create export task
+                              taskcreateresponse = logclient.create_export_task(
+                                  taskName=friendlyloggroup + " at " + str(startexecution),
+                                  logGroupName=event["loggroup"],
+                                  fromTime=int(startstamp),
+                                  to=int(startexecution),
+                                  destination=os.environ['S3Bucket'],
+                                  destinationPrefix=aws_account_id + "/" + friendlyloggroup
+                              )
+                              #Retrieve the newly created task using the taskid payload from the create API Call
+                              describeresponse = describeexport(taskcreateresponse["taskId"])
+
+                              #Loop while to make sure task transitions to Running
+                              while "PENDING" in describeresponse["status"]["code"]  or describeresponse["status"]["code"] == "RUNNING":
+                                  describeresponse = describeexport(taskcreateresponse["taskId"])
+                                  
+                          except Exception as e:
+                              error = str(e).replace('"','')
+                              print(error)
+                              dataUpdateResponse = table.update_item(
+                                  Key={"loggroup": friendlyloggroup},
+                                  UpdateExpression="set lastmessage=:message", 
+                                  ExpressionAttributeValues={":message": str(error)}
+                                  )
+                              return { event["loggroup"] : "Exception: " + repr(e) }
+                          else:    
+                              message = describeresponse["status"]["code"] + " : " + describeresponse["status"]["message"]
+                              elapsedmessage = "creationTime: " + str(describeresponse["executionInfo"]["creationTime"]) + " : completionTime: " + str(describeresponse["executionInfo"]["completionTime"]) + " | " + message
+                              print(elapsedmessage)    
+                              print(message)
+                              if describeresponse["status"]["code"] == "COMPLETED":
+                                  dataUpdateResponse = table.update_item(
+                                      Key={"loggroup": friendlyloggroup},
+                                      UpdateExpression="set lastexport=:startexecution, lastmessage=:message", 
+                                      ExpressionAttributeValues={":startexecution": int(startexecution), ":message": str(elapsedmessage)}
+                                      )
+                              else:
+                                  dataUpdateResponse = table.update_item(
+                                      Key={"loggroup": friendlyloggroup},
+                                      UpdateExpression="set lastmessage=:message", 
+                                      ExpressionAttributeValues={":message": elapsedmessage  }
+                                      )
+                              return { event["loggroup"] : message }
+                          
+                      def describeexport(taskId):
+                          return logclient.describe_export_tasks(taskId=taskId)["exportTasks"][0]
+                          
+                      def camel_case(s):
+                          s = s.replace("/","_")
+                          s = sub(r"(_|-)+", " ", s).title().replace(" ", "")
+                          return ''.join([s[0].lower(), s[1:]])
+
+
+
+            MemorySize: 128
+            Role: !GetAtt LambdaCloudWatchLogGroupExportsRole.Arn
+            
+            Runtime: "python3.10"
+            Timeout: 900
+            TracingConfig: 
+                Mode: "PassThrough"
+            EphemeralStorage: 
+                Size: 512
+
+    CloudWatchLogGroupStateMachine:
+        Type: "AWS::StepFunctions::StateMachine"
+        Properties:
+            DefinitionString: !Sub |
+                {
+                  "Comment": "A description of my state machine",
+                  "StartAt": "Query Lock Record",
+                  "States": {
+                    "Query Lock Record": {
+                      "Type": "Task",
+                      "Next": "CheckIfLockRecordExists",
+                      "Parameters": {
+                        "TableName": "${CloudWatchLogGroupExportLockDynamoTable}",
+                        "ScanIndexForward": true,
+                        "KeyConditionExpression": "locked = :locked",
+                        "ExpressionAttributeValues": {
+                          ":locked": {
+                            "S": "primary"
+                          }
+                        }
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:dynamodb:query"
+                    },
+                    "Create Lock Record": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::dynamodb:putItem",
+                      "Parameters": {
+                        "TableName": "${CloudWatchLogGroupExportLockDynamoTable}",
+                        "Item": {
+                          "locked": {
+                            "S": "primary"
+                          },
+                          "busy": {
+                            "S": "false"
+                          }
+                        }
+                      },
+                      "Next": "Query Lock Record"
+                    },
+                    "CheckIfLockRecordExists": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Variable": "$.Count",
+                          "NumericGreaterThan": 0,
+                          "Next": "Check Lock"
+                        }
+                      ],
+                      "Default": "Create Lock Record",
+                      "OutputPath": "$.Items"
+                    },
+                    "Check Lock": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Variable": "$[0].busy.S",
+                          "StringEquals": "false",
+                          "Next": "Set Record Lock"
+                        }
+                      ],
+                      "Default": "Wait Until Lock is Removed",
+                      "InputPath": "$"
+                    },
+                    "Set Record Lock": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::dynamodb:updateItem",
+                      "Parameters": {
+                        "TableName": "${CloudWatchLogGroupExportLockDynamoTable}",
+                        "Key": {
+                          "locked": "primary"
+                        },
+                        "UpdateExpression": "SET busy = :busy",
+                        "ExpressionAttributeValues": {
+                          ":busy": "true"
+                        }
+                      },
+                      "Next": "Invoke FilterCloudWatchLogGroups"
+                    },
+                    "Wait Until Lock is Removed": {
+                      "Type": "Wait",
+                      "Seconds": 5,
+                      "Next": "Query Lock Record"
+                    },
+                    "Invoke FilterCloudWatchLogGroups": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${FilterCloudWatchLogGroupsLambdaFunction.Arn}:$LATEST",
+                        "Payload.$": "$"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 2,
+                          "MaxAttempts": 6,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "Next": "Decide Which Way to Process"
+                    },
+                    "Decide Which Way to Process": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "And": [
+                            {
+                              "Variable": "$.Payload.records",
+                              "NumericGreaterThan": 0
+                            }
+                          ],
+                          "Next": "Map Log Groups to Export Process"
+                        },
+                        {
+                          "And": [
+                            {
+                              "Not": {
+                                "Variable": "$.Payload.nextToken",
+                                "StringEquals": ""
+                              }
+                            },
+                            {
+                              "Variable": "$.Payload.records",
+                              "NumericEquals": 0
+                            }
+                          ],
+                          "Next": "Invoke FilterCloudWatchLogGroups"
+                        }
+                      ],
+                      "Default": "Remove Record Lock"
+                    },
+                    "Map Log Groups to Export Process": {
+                      "Type": "Map",
+                      "ItemProcessor": {
+                        "ProcessorConfig": {
+                          "Mode": "DISTRIBUTED",
+                          "ExecutionType": "STANDARD"
+                        },
+                        "StartAt": "Invoke CloudWatchLogGroupBatchExport",
+                        "States": {
+                          "Invoke CloudWatchLogGroupBatchExport": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "${ExportCloudWatchLogGroupsLambdaFunction.Arn}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 6,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "End": true
+                          }
+                        }
+                      },
+                      "InputPath": "$.Payload.data",
+                      "MaxConcurrency": 1,
+                      "Label": "MapLogGroupstoExportProcess",
+                      "Next": "Invoke FilterCloudWatchLogGroups"
+                    },
+                    "Remove Record Lock": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::dynamodb:updateItem",
+                      "Parameters": {
+                        "TableName": "${CloudWatchLogGroupExportLockDynamoTable}",
+                        "Key": {
+                          "locked": "primary"
+                        },
+                        "UpdateExpression": "SET busy = :busy",
+                        "ExpressionAttributeValues": {
+                          ":busy": "false"
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                }
+            RoleArn: !GetAtt StepFunctionsCloudWatchLogExportStateMachineRole.Arn
+            StateMachineType: "STANDARD"
+            LoggingConfiguration: 
+                Destinations: 
+                  - CloudWatchLogsLogGroup: 
+                        LogGroupArn: !GetAtt StepFunctionsCloudWatchLogExportStateMachineLogGroup.Arn
+                IncludeExecutionData: true
+                Level: "ALL"
+
+    CloudWatchLogGroupExportSchedule:
+        Type: "AWS::Scheduler::Schedule"
+        Properties:
+            Description: ""
+            State: "ENABLED"
+            GroupName: "default"
+            ScheduleExpression: "rate(24 hours)"
+            ScheduleExpressionTimezone: "America/New_York"
+            FlexibleTimeWindow: 
+                Mode: "OFF"
+            Target: 
+                Arn: !Ref CloudWatchLogGroupStateMachine
+                Input: "{}"
+                RetryPolicy: 
+                    MaximumEventAgeInSeconds: 86400
+                    MaximumRetryAttempts: 185
+                RoleArn: !GetAtt CloudWatchLogGroupExportScheduleRole.Arn
+
+
+    CloudWatchLogGroupExportScheduleRole:
+        Type: AWS::IAM::Role
+        Properties:
+          AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"scheduler.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+          Path: "/service-role/"
+          Policies:
+            -
+              PolicyName: "Schedule-CloudWatchLogGroupExportSchedule-Policy"
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  -
+                    Effect: "Allow"
+                    Action:
+                        - "states:StartExecution"
+                    Resource: 
+                    - !Ref CloudWatchLogGroupStateMachine
+
+    LambdaCloudWatchLogGroupExportsRole:
+        Type: AWS::IAM::Role
+        Properties:
+          AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+          Path: "/service-role/"
+          Policies:
+            -
+              PolicyName: "DynamoDB-CloudWatchLogGroupExports-Policy"
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  -
+                    Effect: "Allow"
+                    Action:
+                        - "dynamodb:GetItem"
+                        - "dynamodb:PutItem"
+                        - "dynamodb:Query"
+                        - "dynamodb:UpdateItem"
+                    Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${CloudWatchLogGroupExportsDynamoTable}"
+            - 
+              PolicyName: "CloudWatch-CloudWatchLogGroupExports-Policy"
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                - Effect: Allow
+                  Action: 
+                  - logs:CreateLogGroup
+                  - logs:ListTagsForResource
+                  - logs:ListTagsLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:DescribeExportTasks
+                  - logs:CreateExportTask
+                  Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+                - Effect: Allow
+                  Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  Resource: "*"
+
+
+    StepFunctionsCloudWatchLogExportStateMachineRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: "/service-role/"
+            AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"states.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+            MaxSessionDuration: 3600
+            Policies:
+            -
+              PolicyName: "StateMachine-InvokeScopedAccessPolicy-CloudWatchLogExport"
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: "Allow"
+                    Resource: 
+                    - !Sub "${FilterCloudWatchLogGroupsLambdaFunction.Arn}:$LATEST"
+                    - !Sub "${ExportCloudWatchLogGroupsLambdaFunction.Arn}:$LATEST"
+                    Action:
+                    - "lambda:InvokeFunction"
+            -        
+              PolicyName: "StateMachine-CloudWatchLogExport"
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: "Allow"
+                    Resource: !Sub  "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*"
+                    Action:
+                    - states:StartExecution
+            -        
+              PolicyName: "StateMachine-AccessCloudWatch-CloudWatchLogExport"
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: "Allow"
+                    Resource: "*"
+                    Action:
+                    - logs:CreateLogDelivery
+                    - logs:CreateLogStream
+                    - logs:GetLogDelivery
+                    - logs:UpdateLogDelivery
+                    - logs:DeleteLogDelivery
+                    - logs:ListLogDeliveries
+                    - logs:PutLogEvents
+                    - logs:PutResourcePolicy
+                    - logs:DescribeResourcePolicies
+                    - logs:DescribeLogGroups
+            -       
+              PolicyName: "StateMachine-AccessDynamoDB-CloudWatchLogExport" 
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  -
+                    Effect: "Allow"
+                    Action:
+                        - "dynamodb:GetItem"
+                        - "dynamodb:PutItem"
+                        - "dynamodb:Query"
+                        - "dynamodb:UpdateItem"
+                    Resource: 
+                    - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${CloudWatchLogGroupExportLockDynamoTable}" 
+
+    StepFunctionsCloudWatchLogExportStateMachineLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties: 
+          RetentionInDays: 14
